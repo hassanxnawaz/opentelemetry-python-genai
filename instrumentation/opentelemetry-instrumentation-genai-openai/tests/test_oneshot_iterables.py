@@ -4,7 +4,6 @@
 """Content capture must not empty a one-shot messages or tools iterable."""
 
 import json
-import os
 
 import httpx
 import pytest
@@ -15,6 +14,9 @@ from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
     InMemorySpanExporter,
+)
+from opentelemetry.semconv._incubating.attributes import (
+    gen_ai_attributes as GenAIAttributes,
 )
 
 MSGS = [
@@ -65,9 +67,10 @@ def _handler(received):
 
 
 @pytest.fixture
-def captured():
-    os.environ["OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT"] = (
-        "span_only"
+def captured(monkeypatch):
+    monkeypatch.setenv(
+        "OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT",
+        "span_only",
     )
     exporter = InMemorySpanExporter()
     provider = TracerProvider()
@@ -82,12 +85,26 @@ def captured():
         exporter.clear()
 
 
+def _captured_contents(exporter):
+    spans = exporter.get_finished_spans()
+    assert spans
+    raw = spans[-1].attributes[GenAIAttributes.GEN_AI_INPUT_MESSAGES]
+    messages = json.loads(raw)
+    return [
+        part["content"]
+        for message in messages
+        for part in message["parts"]
+    ]
+
+
 def test_content_capture_does_not_empty_oneshot_messages_or_tools(captured):
     received, exporter = captured
     client = OpenAI(
         api_key="x",
         base_url="http://mock/v1",
-        http_client=httpx.Client(transport=httpx.MockTransport(_handler(received))),
+        http_client=httpx.Client(
+            transport=httpx.MockTransport(_handler(received))
+        ),
     )
 
     client.chat.completions.create(model="m", messages=(m for m in MSGS))
@@ -95,6 +112,7 @@ def test_content_capture_does_not_empty_oneshot_messages_or_tools(captured):
         "be brief",
         "hi",
     ]
+    assert _captured_contents(exporter) == ["be brief", "hi"]
 
     client.chat.completions.create(
         model="m", messages=MSGS, tools=(t for t in TOOLS)
@@ -102,12 +120,31 @@ def test_content_capture_does_not_empty_oneshot_messages_or_tools(captured):
     assert received[-1]["tools"][0]["function"]["name"] == "get_weather"
     assert len(received[-1]["messages"]) == 2
 
-    client.chat.completions.create(
-        model="m", messages=map(lambda m: m, MSGS)
-    )
+    client.chat.completions.create(model="m", messages=map(lambda m: m, MSGS))
     assert len(received[-1]["messages"]) == 2
 
-    assert exporter.get_finished_spans()
+
+def test_reused_mutable_message_keeps_each_yield(captured):
+    received, exporter = captured
+    message = {"role": "user", "content": "first"}
+
+    def generate():
+        yield message
+        message["content"] = "second"
+        yield message
+
+    client = OpenAI(
+        api_key="x",
+        base_url="http://mock/v1",
+        http_client=httpx.Client(
+            transport=httpx.MockTransport(_handler(received))
+        ),
+    )
+    client.chat.completions.create(model="m", messages=generate())
+
+    transmitted = [item["content"] for item in received[-1]["messages"]]
+    assert len(transmitted) == 2
+    assert _captured_contents(exporter) == ["first", "second"]
 
 
 @pytest.mark.asyncio()
@@ -120,8 +157,6 @@ async def test_async_content_capture_does_not_empty_oneshot_messages(captured):
             transport=httpx.MockTransport(_handler(received))
         ),
     )
-    await client.chat.completions.create(
-        model="m", messages=(m for m in MSGS)
-    )
+    await client.chat.completions.create(model="m", messages=(m for m in MSGS))
     assert len(received[-1]["messages"]) == 2
     assert exporter.get_finished_spans()
