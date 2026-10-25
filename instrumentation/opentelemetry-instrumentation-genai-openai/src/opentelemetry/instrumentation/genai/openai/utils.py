@@ -230,15 +230,6 @@ def create_chat_invocation(
         )
 
     if capture_content:  # optimization
-        # Reading a generator or map() to record it empties it. The SDK
-        # would then send no messages or no tools. Materialize once and
-        # hand that list to the wrapped call.
-        if "messages" in kwargs:
-            kwargs["messages"] = _materialize_for_capture(
-                kwargs.get("messages")
-            )
-        if "tools" in kwargs:
-            kwargs["tools"] = _materialize_for_capture(kwargs.get("tools"))
         invocation.input_messages = _prepare_input_messages(
             kwargs.get("messages", [])
         )
@@ -419,25 +410,6 @@ def _content_to_parts(content: Any) -> list[MessagePart]:
                 )
             )
     return parts
-
-
-def _materialize_for_capture(value):
-    """Return a sequence the SDK can still read after content capture.
-
-    Lists and tuples can be walked twice. A generator, ``map()``, or other
-    one-shot iterable cannot. ``NotGiven`` and omitted values stay as they are.
-    """
-    if not value_is_set(value):
-        return value
-    if isinstance(value, (str, bytes, bytearray)):
-        return value
-    if isinstance(value, Mapping):
-        return value
-    if isinstance(value, Sequence):
-        return value
-    if isinstance(value, Iterable):
-        return list(value)
-    return value
 
 
 def _prepare_input_messages(messages) -> list[InputMessage]:
